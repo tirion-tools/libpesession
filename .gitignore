@@ -1,0 +1,11 @@
+build/
+cmake-build-debug/
+cmake-build-release/
+.cache/
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
