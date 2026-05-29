@@ -164,50 +164,39 @@ ConvertReport convert_pesession_to_osession(const std::string& in_path,
             im.total_time  = meta.total_time;
             im.actual_rows = meta.actual_rows;
             im.plan_type   = meta.plan_type;
+            // One pass over the blob for every artefact, vs five extracts before.
+            auto payload = read_pesession_item_payload(in_path,
+                                                       meta.file_number);
+
             // Pull the user-submitted batch SQL (the QueryAnalyzer
             // context's traceRowText) and persist it alongside the
             // item so the openplan reader can show it without re-
             // parsing the NRBF.
-            try {
-                im.batch_text = read_pesession_batch_text(
-                    in_path, meta.file_number);
-            } catch (...) {}
-            try {
-                // Stored verbatim. gzipped JSON. The Index Analysis
-                // panel decompresses + parses on demand.
-                im.index_analyzer_gz = read_pesession_index_analyzer_gz(
-                    in_path, meta.file_number);
-            } catch (...) {}
+            im.batch_text = std::move(payload.batch_text);
+
+            // Stored gzipped; the Index Analysis panel decompresses on demand.
+            im.index_analyzer_gz = std::move(payload.index_analyzer_gz);
+
             // ConnectionParameters. auth type + server version round-
             // trip so openplan can show the same identity SQL Sentry
             // would. Login from ConnectionParameters wins over the
             // PeSessionMeta login only when the meta value is empty
             // (the JSON manifest sometimes omits it).
-            try {
-                auto cp = read_pesession_connection_params(
-                    in_path, meta.file_number);
-                im.auth_type      = cp.auth_type;
-                im.server_version = cp.server_version;
-                if (im.login.empty()) im.login = cp.login;
-            } catch (...) {}
+            im.auth_type      = std::move(payload.connection_params.auth_type);
+            im.server_version = std::move(payload.connection_params.server_version);
+            if (im.login.empty()) {
+                im.login = std::move(payload.connection_params.login);
+            }
             out.add_item(im);
 
-            std::vector<std::string> blocks;
-            try {
-                blocks = extract_pesession_xml_blocks(in_path,
-                                                      meta.file_number);
-            } catch (const std::exception&) {
-                continue;
-            }
+            auto& blocks = payload.showplan_xml_blocks;
 
             // Read trace events once. Each TraceRowEx is one
             // sp_statement_completed firing. including EXEC
             // dispatcher statements that have no ShowPlanXML of
             // their own. We emit one statements-row per trace event
             // so the grid matches what SQL Sentry shows.
-            SessionTraceData td;
-            try { td = read_pesession_traces(in_path, meta.file_number); }
-            catch (const std::exception&) {}
+            auto& td = payload.traces;
 
             // Walk plan blocks: persist plans + snapshots, then
             // index each StmtSimple by (parent_object_id,

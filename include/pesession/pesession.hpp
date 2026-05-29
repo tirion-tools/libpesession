@@ -56,6 +56,8 @@ struct PeSessionConnection {
     bool use_integrated_security = false;
 };
 
+[[deprecated("Use read_pesession_item_payload, which extracts and parses "
+             "the queryanalysis blob once for all four consumers.")]]
 PeSessionConnection read_pesession_connection_params(const std::string& path,
                                                      int file_number);
 
@@ -135,6 +137,8 @@ struct SessionTraceData {
 
 // Parses the .queryanalysis entry's NRBF payload (silently returns an
 // empty SessionTraceData if the entry is missing or the parse fails).
+[[deprecated("Use read_pesession_item_payload, which extracts and parses "
+             "the queryanalysis blob once for all four consumers.")]]
 SessionTraceData read_pesession_traces(const std::string& path,
                                        int file_number);
 
@@ -143,18 +147,40 @@ SessionTraceData read_pesession_traces(const std::string& path,
 // standalone, parseable XML string suitable for storing directly in an
 // osession `plans` row. Returns an empty vector when the item is absent
 // or has no embedded plans.
+[[deprecated("Use read_pesession_item_payload, which extracts the "
+             "queryanalysis blob once for all four consumers + the "
+             "ShowPlanXML substring scan.")]]
 std::vector<std::string> extract_pesession_xml_blocks(const std::string& path,
                                                       int file_number);
 
 // Batch SQL the user submitted for this item. Sourced from
 // QueryAnalyzerContext.traceRowText. Includes GO separators, DBCC
 // lines, comments. Empty when traceRowText isn't present.
+[[deprecated("Use read_pesession_item_payload, which extracts and parses "
+             "the queryanalysis blob once for all four consumers.")]]
 std::string read_pesession_batch_text(const std::string& path,
                                       int file_number);
 
 // Raw gzipped JSON from QueryAnalyzerInput.IndexAnalyzerResultsGz.
 // Caller decompresses on demand. Empty when no analyzer payload.
+[[deprecated("Use read_pesession_item_payload, which extracts and parses "
+             "the queryanalysis blob once for all four consumers.")]]
 std::string read_pesession_index_analyzer_gz(const std::string& path,
                                               int file_number);
+
+// Fused single-pass read of one item's .queryanalysis blob, replacing the
+// four deprecated readers above: opens the archive once, extracts once, and
+// runs one nrbf::parse via MultiVisitor. No throw: fields are empty when the
+// item is absent or unreadable, and NRBF parse errors are absorbed.
+struct PeSessionItemPayload {
+    std::vector<std::string> showplan_xml_blocks;
+    SessionTraceData         traces;
+    PeSessionConnection      connection_params;
+    std::string              batch_text;
+    std::string              index_analyzer_gz;
+};
+
+PeSessionItemPayload read_pesession_item_payload(const std::string& path,
+                                                 int file_number);
 
 }  // namespace pesession
