@@ -1,4 +1,5 @@
 #include "pesession/pesession.hpp"
+#include "pesession/profile.hpp"
 
 #include <nlohmann/json.hpp>
 #include <miniz.h>
@@ -34,6 +35,7 @@ struct ZipHandle {
 };
 
 std::string extract_entry(mz_zip_archive& zip, const char* name) {
+    PE_ZONE_N("pesession::extract_entry");
     int idx = mz_zip_reader_locate_file(&zip, name, nullptr, 0);
     if (idx < 0) {
         throw PeSessionError(std::string("Missing entry: ") + name);
@@ -250,17 +252,6 @@ private:
 
 namespace {
 
-// True if a class-member name like "<Field>k__BackingField" or
-// "TraceRow+<Field>k__BackingField" refers to the auto-property `simple`.
-bool field_is(std::string_view name, std::string_view simple) {
-    auto open = name.find('<');
-    auto close = name.find(">k__BackingField");
-    if (open == std::string_view::npos || close == std::string_view::npos) {
-        return false;
-    }
-    return name.substr(open + 1, close - open - 1) == simple;
-}
-
 std::string bytes_to_hex(const std::vector<uint8_t>& b) {
     static const char* hex = "0123456789abcdef";
     std::string s;
@@ -315,37 +306,47 @@ public:
         current_member_ = m.name;
         if (stack_.empty()) return;
         Frame& top = stack_.back();
+        if (top.kind == Kind::Other || top.kind == Kind::PlanData) return;
+
+        // Decode .NET's "<Field>k__BackingField" wrapper once per member;
+        // doing it inside each field comparison shows up as the trace-
+        // stream hot path.
+        auto open = m.name.find('<');
+        auto close = m.name.find(">k__BackingField");
+        if (open == std::string_view::npos || close == std::string_view::npos)
+            return;
+        std::string_view f(m.name);
+        f = f.substr(open + 1, close - open - 1);
+
         switch (top.kind) {
         case Kind::TraceRow:
-            if      (field_is(m.name, "Duration"))  top.m.duration_us = v.i;
-            else if (field_is(m.name, "Cpu"))       top.m.cpu_us      = v.i;
-            else if (field_is(m.name, "Reads"))     top.m.reads       = v.i;
-            else if (field_is(m.name, "Writes"))    top.m.writes      = v.i;
-            else if (field_is(m.name, "RowCounts")) top.m.row_count   = v.i;
-            else if (field_is(m.name, "StartTimeUtc") &&
+            if      (f == "Duration")  top.m.duration_us = v.i;
+            else if (f == "Cpu")       top.m.cpu_us      = v.i;
+            else if (f == "Reads")     top.m.reads       = v.i;
+            else if (f == "Writes")    top.m.writes      = v.i;
+            else if (f == "RowCounts") top.m.row_count   = v.i;
+            else if (f == "StartTimeUtc" &&
                      v.kind == nrbf::Value::Kind::DateTime) {
                 top.m.start_dt_raw = v.u;
             }
-            else if (field_is(m.name, "EndTimeUtc") &&
+            else if (f == "EndTimeUtc" &&
                      v.kind == nrbf::Value::Kind::DateTime) {
                 top.m.end_dt_raw = v.u;
             }
-            // Sproc / nesting provenance. ObjectName is a string in
-            // the NRBF stream. may come as an inline String or a
-            // forward ObjectRef into the dictionary; both paths
-            // resolve via resolve_string() + pending_object_strings_.
-            else if (field_is(m.name, "ObjectName")) {
+            // ObjectName may stream inline or as a forward ObjectRef into
+            // the shared string dictionary; both paths resolve here.
+            else if (f == "ObjectName") {
                 top.m.object_name = resolve_string(v);
                 if (top.m.object_name.empty() &&
                     v.kind == nrbf::Value::Kind::ObjectRef && v.object_id) {
                     top.pending_object_name_id = v.object_id;
                 }
             }
-            else if (field_is(m.name, "ObjectID"))   top.m.object_id   = static_cast<int32_t>(v.i);
-            else if (field_is(m.name, "NestLevel"))  top.m.nest_level  = static_cast<int32_t>(v.i);
-            else if (field_is(m.name, "LineNumber")) top.m.line_number = static_cast<int32_t>(v.i);
-            else if (field_is(m.name, "Offset"))     top.m.offset_bytes = v.i;
-            else if (field_is(m.name, "TextData")) {
+            else if (f == "ObjectID")   top.m.object_id   = static_cast<int32_t>(v.i);
+            else if (f == "NestLevel")  top.m.nest_level  = static_cast<int32_t>(v.i);
+            else if (f == "LineNumber") top.m.line_number = static_cast<int32_t>(v.i);
+            else if (f == "Offset")     top.m.offset_bytes = v.i;
+            else if (f == "TextData") {
                 top.m.text = resolve_string(v);
                 if (top.m.text.empty() &&
                     v.kind == nrbf::Value::Kind::ObjectRef && v.object_id) {
@@ -354,23 +355,23 @@ public:
             }
             break;
         case Kind::QueryStats:
-            if      (field_is(m.name, "CpuTime"))      top.m.cpu_us         = v.i;
-            else if (field_is(m.name, "Duration"))     top.m.duration_us    = v.i;
-            else if (field_is(m.name, "LogicalReads")) top.m.reads          = v.i;
-            else if (field_is(m.name, "UdfCpuTime"))   top.m.udf_cpu_us     = v.i;
-            else if (field_is(m.name, "UdfDuration"))  top.m.udf_duration_us= v.i;
+            if      (f == "CpuTime")      top.m.cpu_us         = v.i;
+            else if (f == "Duration")     top.m.duration_us    = v.i;
+            else if (f == "LogicalReads") top.m.reads          = v.i;
+            else if (f == "UdfCpuTime")   top.m.udf_cpu_us     = v.i;
+            else if (f == "UdfDuration")  top.m.udf_duration_us= v.i;
             break;
         case Kind::WaitAggregate:
-            if (field_is(m.name, "WaitType")) {
+            if (f == "WaitType") {
                 top.w.wait_type = resolve_string(v);
                 if (top.w.wait_type.empty() &&
                     v.kind == nrbf::Value::Kind::ObjectRef &&
                     v.object_id) {
                     top.pending_wait_type_id = v.object_id;
                 }
-            } else if (field_is(m.name, "TotalDuration")) {
+            } else if (f == "TotalDuration") {
                 top.w.total_duration_ms = v.i;
-            } else if (field_is(m.name, "TotalSignalDuration")) {
+            } else if (f == "TotalSignalDuration") {
                 top.w.total_signal_ms = v.i;
             }
             break;
@@ -419,6 +420,8 @@ public:
         case Kind::TraceRow:
             {
                 size_t idx = out.traces.size();
+                if (out.traces.empty() && observed_max_array_len_ > 0)
+                    out.traces.reserve(observed_max_array_len_);
                 out.traces.push_back(f.m);
                 if (f.pending_object_name_id != 0) {
                     pending_trace_object_names_.emplace_back(
@@ -459,7 +462,7 @@ public:
     }
 
     void string_object(int32_t id, std::string_view s) override {
-        strings_.emplace(id, std::string(s));
+        strings_.emplace(id, s);
         // Resolve any pending forward refs that pointed at this id.
         // Cheap linear scan. wait-aggregate counts are tiny relative
         // to the rest of the trace stream.
@@ -498,23 +501,30 @@ public:
         }
     }
 
-    bool enter_object_array(int32_t, int32_t) override { return true; }
+    bool enter_object_array(int32_t, int32_t length) override {
+        if (length > observed_max_array_len_) observed_max_array_len_ = length;
+        return true;
+    }
 
 private:
     std::string resolve_string(const nrbf::Value& v) const {
         if (!v.s.empty()) return v.s;
         if (v.kind == nrbf::Value::Kind::ObjectRef && v.object_id) {
             auto it = strings_.find(v.object_id);
-            if (it != strings_.end()) return it->second;
+            if (it != strings_.end()) return std::string(it->second);
         }
         return {};
     }
 
     std::vector<Frame> stack_;
-    std::string        current_member_;
+    // View into m.name; ClassDef in the parser map outlives the parse.
+    std::string_view   current_member_;
+    // Upper bound for out.traces.reserve() on the first TraceRow push.
+    int32_t            observed_max_array_len_ = 0;
     bool               collecting_bytes_ = false;
     std::vector<uint8_t> byte_buf_;
-    std::unordered_map<int32_t, std::string> strings_;
+    // Views into the parse-input blob; copy to owned only at resolve.
+    std::unordered_map<int32_t, std::string_view> strings_;
     // (out.waits index, pending StringObject id) tuples. patched as
     // the matching StringObject records stream in. Forward references
     // are common because SQL Sentry serializes wait types as a shared
@@ -564,6 +574,7 @@ SessionTraceData read_pesession_traces(const std::string& path, int file_number)
 
 std::vector<StatementRuntimeAgg> read_pesession_runtime(const std::string& path,
                                                         int file_number) {
+    PE_ZONE_N("pesession::read_runtime");
     ZipHandle zh(path);
     if (!zh.open) return {};
 
@@ -669,13 +680,13 @@ public:
             if (!v.s.empty()) result = v.s;
         } else if (v.kind == nrbf::Value::Kind::ObjectRef && v.object_id) {
             auto it = strings_.find(v.object_id);
-            if (it != strings_.end()) result = it->second;
+            if (it != strings_.end()) result.assign(it->second);
             else pending_id_ = v.object_id;   // resolve on string_object
         }
     }
     void string_object(int32_t id, std::string_view s) override {
         if (id == pending_id_) { result.assign(s); pending_id_ = 0; }
-        strings_.emplace(id, std::string(s));
+        strings_.emplace(id, s);
     }
     bool enter_object_array(int32_t, int32_t) override { return true; }
     bool enter_primitive_array(int32_t, nrbf::PrimitiveType, int32_t) override {
@@ -686,7 +697,8 @@ private:
     // QueryAnalyzerContext. Members fire against the top frame.
     std::vector<bool> stack_;
     int32_t pending_id_ = 0;
-    std::unordered_map<int32_t, std::string> strings_;
+    // Views into the parse-input blob; copy to owned only at resolve.
+    std::unordered_map<int32_t, std::string_view> strings_;
 };
 
 }  // namespace
@@ -718,7 +730,7 @@ public:
                 dst = v.s;
             } else if (v.kind == nrbf::Value::Kind::ObjectRef && v.object_id) {
                 auto it = strings_.find(v.object_id);
-                if (it != strings_.end()) dst = it->second;
+                if (it != strings_.end()) dst.assign(it->second);
                 else pending_.emplace_back(v.object_id, &dst);
             }
         };
@@ -734,7 +746,7 @@ public:
         }
     }
     void string_object(int32_t id, std::string_view s) override {
-        strings_.emplace(id, std::string(s));
+        strings_.emplace(id, s);
         for (auto it = pending_.begin(); it != pending_.end(); ) {
             if (it->first == id) {
                 it->second->assign(s);
@@ -750,7 +762,8 @@ public:
     }
 private:
     std::vector<bool> stack_;
-    std::unordered_map<int32_t, std::string> strings_;
+    // Views into the parse-input blob; copy to owned only at resolve.
+    std::unordered_map<int32_t, std::string_view> strings_;
     std::vector<std::pair<int32_t, std::string*>> pending_;
 };
 
@@ -862,6 +875,7 @@ std::string read_pesession_queryanalysis_blob(const std::string& path,
 }
 
 std::vector<std::string> scan_showplan_blocks(std::string_view blob) {
+    PE_ZONE_N("pesession::scan_showplan_blocks");
     std::vector<std::string> out;
     auto views = extract_showplan_blocks(blob);
     out.reserve(views.size());
@@ -870,6 +884,7 @@ std::vector<std::string> scan_showplan_blocks(std::string_view blob) {
 }
 
 PeSessionItemPayload parse_pesession_queryanalysis(std::string_view blob) {
+    PE_ZONE_N("pesession::parse_queryanalysis");
     // One parse, four visitors: replaces four separate extract+parse passes.
     PeSessionItemPayload out;
     TraceVisitor             trace;
