@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace pesession {
@@ -182,5 +183,14 @@ struct PeSessionItemPayload {
 
 PeSessionItemPayload read_pesession_item_payload(const std::string& path,
                                                  int file_number);
+
+// Phase-split building blocks for staged loading. read_pesession_item_payload
+// is just their composition. A caller that wants the plan before the rest
+// extracts the blob once, scans it for ShowPlanXML to render, then parses the
+// NRBF on a worker, reusing the same blob (no second decompress).
+std::string read_pesession_queryanalysis_blob(const std::string& path,
+                                               int file_number);
+std::vector<std::string> scan_showplan_blocks(std::string_view blob);
+PeSessionItemPayload parse_pesession_queryanalysis(std::string_view blob);
 
 }  // namespace pesession

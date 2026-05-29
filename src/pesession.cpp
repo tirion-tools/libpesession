@@ -851,45 +851,27 @@ std::string read_pesession_index_analyzer_gz(const std::string& path,
     return std::move(v.blob);
 }
 
-PeSessionItemPayload read_pesession_item_payload(const std::string& path,
-                                                  int file_number) {
-    // Sub-phase timing, gated by CALLIPER_TIME_LOADS like the calliper side.
-    // Temporary: superseded by the spdlog diagnostics log.
-    using clk = std::chrono::steady_clock;
-    const bool time_loads = std::getenv("CALLIPER_TIME_LOADS") != nullptr;
-    auto t_phase = clk::now();
-    auto tick = [&](const char* name) {
-        if (!time_loads) return;
-        auto now = clk::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - t_phase).count();
-        std::fprintf(stderr, "  [pe %d] %-14s %5lld ms\n",
-                     file_number, name, static_cast<long long>(ms));
-        t_phase = now;
-    };
-
-    PeSessionItemPayload out;
+std::string read_pesession_queryanalysis_blob(const std::string& path,
+                                               int file_number) {
     ZipHandle zh(path);
-    if (!zh.open) return out;
-
+    if (!zh.open) return {};
     char fname[64];
     std::snprintf(fname, sizeof(fname), "%d.queryanalysis", file_number);
-    std::string blob;
-    try { blob = extract_entry(zh.z, fname); }
-    catch (const PeSessionError&) { return out; }
-    if (blob.empty()) return out;
-    tick("extract");
+    try { return extract_entry(zh.z, fname); }
+    catch (const PeSessionError&) { return {}; }
+}
 
-    // ShowPlanXML lives as literal bytes in the stream, so scan for it
-    // directly rather than routing through the NRBF parse below.
-    {
-        auto views = extract_showplan_blocks(blob);
-        out.showplan_xml_blocks.reserve(views.size());
-        for (auto& v : views) out.showplan_xml_blocks.emplace_back(v);
-    }
-    tick("xml scan");
+std::vector<std::string> scan_showplan_blocks(std::string_view blob) {
+    std::vector<std::string> out;
+    auto views = extract_showplan_blocks(blob);
+    out.reserve(views.size());
+    for (auto& v : views) out.emplace_back(v);
+    return out;
+}
 
+PeSessionItemPayload parse_pesession_queryanalysis(std::string_view blob) {
     // One parse, four visitors: replaces four separate extract+parse passes.
+    PeSessionItemPayload out;
     TraceVisitor             trace;
     ConnectionParamsVisitor  conn;
     BatchTextVisitor         batch;
@@ -904,12 +886,19 @@ PeSessionItemPayload read_pesession_item_payload(const std::string& path,
     } catch (const nrbf::ParseError&) {
         // Per-visitor contract: swallow parse errors, keep what was captured.
     }
-    tick("nrbf parse");
-
     out.traces            = std::move(trace.out);
     out.connection_params = std::move(conn.result);
     out.batch_text        = std::move(batch.result);
     out.index_analyzer_gz = std::move(index.blob);
+    return out;
+}
+
+PeSessionItemPayload read_pesession_item_payload(const std::string& path,
+                                                  int file_number) {
+    std::string blob = read_pesession_queryanalysis_blob(path, file_number);
+    if (blob.empty()) return {};
+    PeSessionItemPayload out = parse_pesession_queryanalysis(blob);
+    out.showplan_xml_blocks = scan_showplan_blocks(blob);
     return out;
 }
 
