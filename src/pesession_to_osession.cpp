@@ -237,17 +237,61 @@ ConvertReport convert_pesession_to_osession(const std::string& in_path,
                 } catch (const showplan::ParseError&) {}
             }
 
-            // Statements: one row per TraceRowEx. statement_id
-            // matches the trace's document-order index so the
-            // trace_events loop below can FK directly without a
-            // separate join table.
+            // Statements: dedupe by (text, plan_handle_hex,
+            // offset_bytes) so a batch that re-executes the same
+            // statement millions of times (loops, cursors, sproc
+            // dispatchers) collapses to one row per logical
+            // statement. trace_to_stmt_id maps each trace position
+            // to its assigned statement_id so the trace_events +
+            // wait loops below FK correctly.
+            std::vector<int> trace_to_stmt_id(td.traces.size(), -1);
             int statements_written = 0;
             if (!td.traces.empty()) {
+                struct Key {
+                    std::string text;
+                    std::string plan_handle_hex;
+                    int64_t offset_bytes;
+                    bool operator==(const Key& o) const {
+                        return text == o.text &&
+                               plan_handle_hex == o.plan_handle_hex &&
+                               offset_bytes == o.offset_bytes;
+                    }
+                };
+                struct KeyHash {
+                    size_t operator()(const Key& k) const {
+                        size_t h = std::hash<std::string>{}(k.text);
+                        h ^= std::hash<std::string>{}(k.plan_handle_hex) +
+                             0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                        h ^= std::hash<int64_t>{}(k.offset_bytes) +
+                             0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                        return h;
+                    }
+                };
+                std::unordered_map<Key, int, KeyHash> id_by_key;
+                id_by_key.reserve(td.traces.size() / 4 + 16);
+                std::vector<size_t> first_trace_for_id;
+                first_trace_for_id.reserve(id_by_key.bucket_count());
                 for (size_t i = 0; i < td.traces.size(); ++i) {
                     const auto& m = td.traces[i];
+                    Key k{m.text, m.plan_handle_hex, m.offset_bytes};
+                    auto it = id_by_key.find(k);
+                    int sid;
+                    if (it == id_by_key.end()) {
+                        sid = static_cast<int>(id_by_key.size());
+                        id_by_key.emplace(std::move(k), sid);
+                        first_trace_for_id.push_back(i);
+                    } else {
+                        sid = it->second;
+                    }
+                    trace_to_stmt_id[i] = sid;
+                }
+                for (int sid = 0;
+                     sid < static_cast<int>(first_trace_for_id.size());
+                     ++sid) {
+                    const auto& m = td.traces[first_trace_for_id[sid]];
                     osession::Statement st;
                     st.item             = meta.file_number;
-                    st.statement_id     = static_cast<int>(i);
+                    st.statement_id     = sid;
                     st.text             = m.text;
                     st.object_name      = m.object_name;
                     st.nest_level       = m.nest_level;
@@ -310,18 +354,19 @@ ConvertReport convert_pesession_to_osession(const std::string& in_path,
                 }
             } catch (const std::exception&) {}
 
-            // Trace events: statement_id == trace position by
-            // construction above. Wait aggregates still need
-            // plan_handle → statement_id lookup since waits live
-            // inside QueryStats/PlanData scopes rather than under a
-            // specific TraceRowEx. fall back to plan_handles[]
-            // positional indexing (which is what the original code
-            // did, just rewritten here for clarity).
+            // Trace events: every event resolves to a deduped
+            // statement_id via trace_to_stmt_id. trace_pos still
+            // carries the original document-order index so callers
+            // can reconstruct chronology within a (item, statement)
+            // bucket. Waits attach by plan_handle → first trace's
+            // statement_id since waits live inside QueryStats /
+            // PlanData scopes rather than under a specific TraceRowEx.
             std::unordered_map<std::string, int> ph_to_idx;
-            for (size_t i = 0; i < td.plan_handles.size(); ++i) {
-                if (!td.plan_handles[i].empty()) {
-                    ph_to_idx.emplace(td.plan_handles[i],
-                                      static_cast<int>(i));
+            for (size_t i = 0; i < td.traces.size(); ++i) {
+                const auto& m = td.traces[i];
+                if (!m.plan_handle_hex.empty()) {
+                    ph_to_idx.emplace(m.plan_handle_hex,
+                                      trace_to_stmt_id[i]);
                 }
             }
             try {
@@ -331,7 +376,7 @@ ConvertReport convert_pesession_to_osession(const std::string& in_path,
                     const auto& m = td.traces[i];
                     osession::TraceEvent ev;
                     ev.item           = meta.file_number;
-                    ev.statement_id   = static_cast<int>(i);
+                    ev.statement_id   = trace_to_stmt_id[i];
                     ev.trace_pos      = static_cast<int32_t>(i);
                     ev.cpu_us         = m.cpu_us;
                     ev.elapsed_us     = m.duration_us;
